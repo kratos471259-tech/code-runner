@@ -1,0 +1,103 @@
+import cv2
+import dlib
+import numpy as np
+import imutils
+
+# Load models
+predictor_path = "shape_predictor_68_face_landmarks.dat"
+face_detector = dlib.get_frontal_face_detector()
+landmark_predictor = dlib.shape_predictor(predictor_path)
+
+# Function to get landmarks
+def get_landmarks(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = face_detector(gray)
+    if len(faces) == 0:
+        return None
+    return np.matrix([[p.x, p.y] for p in landmark_predictor(gray, faces[0]).parts()])
+
+# Delaunay triangulation helper
+def apply_affine_transform(src, src_tri, dst_tri, size):
+    warp_mat = cv2.getAffineTransform(np.float32(src_tri), np.float32(dst_tri))
+    return cv2.warpAffine(src, warp_mat, (size[0], size[1]), None, flags=cv2.INTER_LINEAR)
+
+# Triangulate and warp
+def warp_triangle(img1, img2, t1, t2):
+    r1 = cv2.boundingRect(np.float32([t1]))
+    r2 = cv2.boundingRect(np.float32([t2]))
+
+    t1_rect = []
+    t2_rect = []
+    for i in range(3):
+        t1_rect.append(((t1[i][0] - r1[0]), (t1[i][1] - r1[1])))
+        t2_rect.append(((t2[i][0] - r2[0]), (t2[i][1] - r2[1])))
+
+    mask = np.zeros((r2[3], r2[2], 3), dtype=np.float32)
+    cv2.fillConvexPoly(mask, np.int32(t2_rect), (1.0, 1.0, 1.0), 16, 0)
+
+    img1_rect = img1[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
+    img2_rect = apply_affine_transform(img1_rect, t1_rect, t2_rect, (r2[2], r2[3]))
+
+    img2_rect = img2_rect * mask
+    img2_part = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]]
+    img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2_part * (1 - mask) + img2_rect
+
+# Main function
+def face_swap(src_img_path, dst_img_path, output_path):
+    img1 = cv2.imread(src_img_path)
+    img2 = cv2.imread(dst_img_path)
+    img1 = imutils.resize(img1, width=400)
+    img2 = imutils.resize(img2, width=400)
+
+    points1 = get_landmarks(img1)
+    points2 = get_landmarks(img2)
+
+    if points1 is None or points2 is None:
+        print("No face detected.")
+        return
+
+    img2_copy = np.copy(img2)
+
+    # Triangulation on destination
+    hull1 = []
+    hull2 = []
+    for i in range(68):
+        hull1.append((points1[i, 0], points1[i, 1]))
+        hull2.append((points2[i, 0], points2[i, 1]))
+
+    rect = cv2.boundingRect(np.array(hull2))
+    subdiv = cv2.Subdiv2D(rect)
+    subdiv.insert(hull2)
+    triangles = subdiv.getTriangleList()
+    triangles = np.array(triangles, dtype=np.int32)
+
+    def extract_index(pt):
+        for i in range(0, len(hull2)):
+            if (pt[0], pt[1]) == hull2[i]:
+                return i
+        return -1
+
+    for t in triangles:
+        pts = [(t[0], t[1]), (t[2], t[3]), (t[4], t[5])]
+        idx = []
+        for p in pts:
+            idx.append(extract_index(p))
+        if -1 in idx:
+            continue
+
+        t1 = [hull1[idx[0]], hull1[idx[1]], hull1[idx[2]]]
+        t2 = [hull2[idx[0]], hull2[idx[1]], hull2[idx[2]]]
+
+        warp_triangle(img1, img2_copy, t1, t2)
+
+    mask = np.zeros(img2.shape, dtype=img2.dtype)
+    cv2.fillConvexPoly(mask, np.int32(hull2), (255, 255, 255))
+
+    center = (rect[0] + rect[2]//2, rect[1] + rect[3]//2)
+    output = cv2.seamlessClone(np.uint8(img2_copy), img2, mask, center, cv2.NORMAL_CLONE)
+
+    cv2.imwrite(output_path, output)
+    print("Face swapped and saved to", output_path)
+
+# Example use
+face_swap("source.jpg", "target.jpg", "swapped.jpg")
